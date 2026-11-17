@@ -1,6 +1,6 @@
 import tkinter as tk
 from queue import Queue
-import main
+from main import mainFunction
 
 news = ""
 duration = 0
@@ -32,7 +32,7 @@ def button_callbackT():
     generate_q.put(True)
     generate_q.put(False)
 def setGenerate():
-    if generate == False:
+    if not generate:
         generate = True
     generate = False
 
@@ -126,7 +126,7 @@ btnGenerate = tk.Button(frame2,
     text = "Generate Snippet",
     fg = "white",
     #command = button_callbackT()
-    command = main.mainFunction()
+    command = mainFunction()
 )
 
 createWindow()
