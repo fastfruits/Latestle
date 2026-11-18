@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Latestle</title>
+  <meta name="description" content="A daily speed game about yesterday's news.">
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <header class="masthead">
+    <button class="icon-btn" id="help-btn" aria-label="How to play">?</button>
+    <div class="masthead-title">
+      <h1>Latestle</h1>
+      <p class="dateline" id="dateline">&nbsp;</p>
+    </div>
+    <button class="icon-btn" id="stats-btn" aria-label="Statistics">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 20h4V10H4v10Zm6 0h4V4h-4v16Zm6 0h4v-7h-4v7Z"/></svg>
+    </button>
+  </header>
+
+  <main class="page">
+    <p class="loading" id="loading" hidden>Fetching yesterday's headlines…</p>
+
+    <!-- Before the first round -->
+    <section id="intro" class="intro" hidden>
+      <p class="kicker">Yesterday's news</p>
+      <h2 class="intro-title" id="news-date"></h2>
+      <span class="sample-badge" id="sample-badge" hidden>Sample headlines</span>
+      <ul class="intro-rules">
+        <li><strong id="rule-rounds">5</strong> real headlines from yesterday</li>
+        <li>One name in each is <span class="redacted-sample">blacked out</span></li>
+        <li><strong id="rule-seconds">20</strong> seconds to fill it in</li>
+        <li>The faster you are, the more points you score</li>
+      </ul>
+      <button class="btn btn-primary btn-big" id="start-btn">Start</button>
+    </section>
+
+    <!-- During the rounds -->
+    <section id="play" class="play" hidden>
+      <div class="play-bar">
+        <span id="round-label">Headline 1 of 5</span>
+        <span class="score-chip"><span id="score">0</span> pts</span>
+      </div>
+      <div class="timer" aria-hidden="true"><div class="timer-fill" id="timer-fill"></div></div>
+      <p class="timer-text" id="timer-text">20.0</p>
+
+      <article class="headline-card" id="headline-card">
+        <p class="headline-source" id="headline-source"></p>
+        <h2 class="headline" id="headline"></h2>
+        <p class="headline-hint" id="headline-hint" hidden></p>
+      </article>
+
+      <form class="guess-form" id="guess-form" autocomplete="off">
+        <input id="guess-input" type="text" maxlength="60" placeholder="Fill in the blank" aria-label="Your guess" autocapitalize="words" spellcheck="false">
+        <div class="guess-actions">
+          <button type="button" class="btn btn-ghost" id="pass-btn">Pass</button>
+          <button type="submit" class="btn btn-primary" id="guess-btn">Guess</button>
+        </div>
+      </form>
+      <p class="tried" id="tried"></p>
+
+      <div class="round-result" id="round-result" hidden>
+        <p class="round-verdict" id="round-verdict"></p>
+        <button class="btn btn-primary btn-big" id="next-btn">Next headline</button>
+      </div>
+    </section>
+
+    <!-- After the last round -->
+    <section id="summary" class="summary" hidden>
+      <p class="kicker">Final score</p>
+      <p class="final-score"><span id="final-score">0</span><small> pts</small></p>
+      <p class="final-squares" id="final-squares"></p>
+      <div class="result-actions">
+        <button class="btn btn-primary" id="share-btn">Share result</button>
+      </div>
+      <p class="next-puzzle">Next edition in <span id="countdown">--:--:--</span></p>
+
+      <h2 class="section-title">Yesterday's stories</h2>
+      <ol class="stories" id="stories"></ol>
+    </section>
+  </main>
+
+  <dialog id="help-dialog">
+    <form method="dialog" class="dialog-close"><button aria-label="Close">×</button></form>
+    <h2>How to play</h2>
+    <p>Every day you get <strong>5 real headlines</strong> from the day before. In each one, a name (a person, place, country or company) is <span class="redacted-sample">blacked out</span>.</p>
+    <ul>
+      <li>You have <strong>20 seconds</strong> per headline. Guess as many times as you like.</li>
+      <li>You see the first letter and how long the word is. At 10 seconds, you get an extra hint.</li>
+      <li>A correct answer scores 100 points plus a speed bonus of up to 200.</li>
+    </ul>
+    <p class="legend">
+      <span class="sq sq-fast"></span> under 7s
+      <span class="sq sq-slow"></span> got it
+      <span class="sq sq-miss"></span> missed
+    </p>
+    <p>At the end, catch up on each story with links to the full articles. New headlines arrive at midnight, your time.</p>
+  </dialog>
+
+  <dialog id="stats-dialog">
+    <form method="dialog" class="dialog-close"><button aria-label="Close">×</button></form>
+    <h2>Statistics</h2>
+    <div class="stats-row">
+      <div><strong id="stat-played">0</strong><span>Played</span></div>
+      <div><strong id="stat-best">0</strong><span>Best</span></div>
+      <div><strong id="stat-avg">0</strong><span>Average</span></div>
+      <div><strong id="stat-streak">0</strong><span>Streak</span></div>
+    </div>
+    <h3>Recent scores</h3>
+    <div class="distribution" id="recent"></div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <script src="{{ url_for('static', filename='js/game.js') }}"></script>
+</body>
+</html>

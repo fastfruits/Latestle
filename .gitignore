@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.env
+config.json
+.claude/
+
+# Daily puzzles the server generates from the news
+puzzles/20*.json
