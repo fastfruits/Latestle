@@ -9,3 +9,6 @@ config.json
 
 # Daily puzzles the server generates from the news
 puzzles/20*.json
+
+# Local SQLite database
+instance/

@@ -26,6 +26,57 @@ FEEDS = [
     ("The Guardian", "https://www.theguardian.com/world/rss"),
 ]
 
+
+@dataclass(frozen=True)
+class Category:
+    slug: str
+    name: str
+    feeds: tuple[tuple[str, str], ...]
+
+
+# The main edition ("top") is the general mix above. Each other category is a
+# separate daily puzzle built only from its own feeds.
+TOP = "top"
+CATEGORIES = {c.slug: c for c in [
+    Category(TOP, "Top stories", tuple(FEEDS)),
+    Category("usa", "USA", (
+        ("BBC News", "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml"),
+        ("NPR", "https://feeds.npr.org/1003/rss.xml"),
+        ("NPR", "https://feeds.npr.org/1014/rss.xml"),
+        ("The Guardian", "https://www.theguardian.com/us-news/rss"),
+    )),
+    Category("europe", "Europe", (
+        ("BBC News", "https://feeds.bbci.co.uk/news/world/europe/rss.xml"),
+        ("The Guardian", "https://www.theguardian.com/world/europe-news/rss"),
+        ("Euronews", "https://www.euronews.com/rss?level=theme&name=news"),
+        ("Politico Europe", "https://www.politico.eu/feed/"),
+    )),
+    Category("geopolitics", "Geopolitics", (
+        ("Foreign Policy", "https://foreignpolicy.com/feed/"),
+        ("The Diplomat", "https://thediplomat.com/feed/"),
+        ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+        ("BBC News", "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml"),
+        ("BBC News", "https://feeds.bbci.co.uk/news/world/asia/rss.xml"),
+    )),
+    Category("science", "Science", (
+        ("BBC News", "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"),
+        ("NPR", "https://feeds.npr.org/1007/rss.xml"),
+        ("The Guardian", "https://www.theguardian.com/science/rss"),
+        ("ScienceDaily", "https://www.sciencedaily.com/rss/top/science.xml"),
+    )),
+    Category("tech", "Tech", (
+        ("BBC News", "https://feeds.bbci.co.uk/news/technology/rss.xml"),
+        ("NPR", "https://feeds.npr.org/1019/rss.xml"),
+        ("The Guardian", "https://www.theguardian.com/technology/rss"),
+        ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    )),
+    Category("business", "Business", (
+        ("BBC News", "https://feeds.bbci.co.uk/news/business/rss.xml"),
+        ("NPR", "https://feeds.npr.org/1006/rss.xml"),
+        ("The Guardian", "https://www.theguardian.com/business/rss"),
+    )),
+]}
+
 ROUNDS_PER_DAY = 5
 MIN_WORD_LENGTH = 4
 REDACTED = "[REDACTED]"
@@ -93,7 +144,7 @@ def fetch_feed(source: str, url: str, timeout: float = 10) -> list[Headline]:
     return out
 
 
-def fetch_all() -> list[Headline]:
+def fetch_all(feeds=FEEDS) -> list[Headline]:
     """All headlines from every feed, fetched in parallel. Dead feeds are skipped."""
     def safe(pair):
         try:
@@ -102,8 +153,8 @@ def fetch_all() -> list[Headline]:
             print(f"[latestle] feed failed: {pair[0]}: {e}", file=sys.stderr)
             return []
 
-    with ThreadPoolExecutor(max_workers=len(FEEDS)) as pool:
-        results = pool.map(safe, FEEDS)
+    with ThreadPoolExecutor(max_workers=len(feeds)) as pool:
+        results = pool.map(safe, feeds)
 
     seen, unique = set(), []
     for h in (h for batch in results for h in batch):
@@ -113,16 +164,23 @@ def fetch_all() -> list[Headline]:
     return unique
 
 
+def _on(h: Headline, days: set[date]) -> bool:
+    return bool(h.published) and h.published.astimezone(timezone.utc).date() in days
+
+
 def from_day(headlines: list[Headline], day: date, minimum: int = 15) -> list[Headline]:
     """Headlines published on `day` (UTC). Widens to the surrounding two days
     if that day alone is too thin to build a good puzzle."""
-    def on(h, days):
-        return h.published and h.published.astimezone(timezone.utc).date() in days
-
-    picked = [h for h in headlines if on(h, {day})]
+    picked = [h for h in headlines if _on(h, {day})]
     if len(picked) < minimum:
-        picked = [h for h in headlines if on(h, {day - timedelta(days=1), day, day + timedelta(days=1)})]
+        picked = [h for h in headlines if _on(h, {day - timedelta(days=1), day, day + timedelta(days=1)})]
     return picked
+
+
+def from_recent_days(headlines: list[Headline], day: date, back: int = 3) -> list[Headline]:
+    """Headlines from `day` and the few days before it. A last resort for
+    smaller categories when a single day doesn't have five good stories."""
+    return [h for h in headlines if _on(h, {day - timedelta(days=i) for i in range(-1, back + 1)})]
 
 
 # ---------- Picking answers ----------
@@ -170,6 +228,13 @@ def proper_nouns(text: str) -> list[Word]:
     return found
 
 
+def is_title_case(title: str) -> bool:
+    """Some outlets (Foreign Policy, The Diplomat) capitalise Every Word, so
+    capital letters there say nothing about which words are names."""
+    words = [w for w in re.findall(r"[A-Za-z][\w'’-]*", title) if len(w) >= MIN_WORD_LENGTH]
+    return len(words) >= 3 and sum(w[0].isupper() for w in words) / len(words) > 0.8
+
+
 def _word_re(word: str) -> re.Pattern:
     return re.compile(rf"(?<![\w-]){re.escape(word)}(?![\w-])")
 
@@ -195,7 +260,7 @@ def build_rounds(headlines: list[Headline], count: int = ROUNDS_PER_DAY) -> list
     # own, at least once. That rules out ordinary words that start a headline
     # ("Government backs...") and fragments of longer names ("Cape Town").
     names = {
-        w.text for h in headlines for w in proper_nouns(h.title)
+        w.text for h in headlines if not is_title_case(h.title) for w in proper_nouns(h.title)
         if w.standalone and not w.starts_sentence
     }
 
@@ -241,14 +306,18 @@ def build_rounds(headlines: list[Headline], count: int = ROUNDS_PER_DAY) -> list
     return rounds
 
 
-def generate(puzzle_date: date) -> dict | None:
-    """A puzzle for `puzzle_date` built from the previous day's news, or None
-    if the feeds didn't give us enough to work with."""
+def generate(puzzle_date: date, category: str = TOP) -> dict | None:
+    """A puzzle for `puzzle_date` built from the previous day's news in
+    `category`, or None if the feeds didn't give us enough to work with."""
     news_date = puzzle_date - timedelta(days=1)
-    rounds = build_rounds(from_day(fetch_all(), news_date))
+    headlines = fetch_all(CATEGORIES[category].feeds)
+    rounds = build_rounds(from_day(headlines, news_date))
+    if len(rounds) < ROUNDS_PER_DAY:
+        rounds = build_rounds(from_recent_days(headlines, news_date))
     if len(rounds) < ROUNDS_PER_DAY:
         return None
     return {
+        "category": category,
         "news_date": news_date.isoformat(),
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "rounds": rounds,

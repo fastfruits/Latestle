@@ -54,11 +54,12 @@ class Round:
     url: str = ""
 
     def public(self) -> dict:
+        """What the player sees while the round is running (the hint is
+        handed out separately, after 10 seconds)."""
         return {
             "headline": self.headline,
             "length": len(self.answer),
             "first_letter": self.answer[0].upper(),
-            "hint": self.hint,
         }
 
     def reveal(self) -> dict:
@@ -77,18 +78,23 @@ class Puzzle:
     news_date: date
     rounds: list[Round]
     sample: bool = False
+    category: str = news.TOP
 
     @property
     def number(self) -> int:
         return (self.date - LAUNCH_DATE).days + 1
 
-    def public(self) -> dict:
+    def meta(self) -> dict:
+        """About the day's puzzle, without any headlines (those are sent one
+        at a time as each round starts)."""
         return {
             "number": self.number,
+            "category": self.category,
+            "category_name": news.CATEGORIES[self.category].name,
             "date": self.date.isoformat(),
             "news_date": self.news_date.isoformat(),
             "round_seconds": ROUND_SECONDS,
-            "rounds": [r.public() for r in self.rounds],
+            "total_rounds": len(self.rounds),
             "sample": self.sample,
         }
 
@@ -105,8 +111,23 @@ def _round_from(data: dict) -> Round:
 
 # ---------- Loading ----------
 
-_lock = threading.Lock()
-_failed_at: dict[date, float] = {}
+_locks: dict[tuple[str, date], threading.Lock] = {}
+_locks_guard = threading.Lock()
+_failed_at: dict[tuple[str, date], float] = {}
+
+
+def _lock_for(key: tuple[str, date]) -> threading.Lock:
+    """One lock per category and day, so building Science doesn't make
+    everyone loading Top stories wait."""
+    with _locks_guard:
+        return _locks.setdefault(key, threading.Lock())
+
+
+def puzzle_path(on: date, category: str = news.TOP) -> Path:
+    """puzzles/YYYY-MM-DD.json for the main edition, YYYY-MM-DD-<category>.json
+    for the others."""
+    suffix = "" if category == news.TOP else f"-{category}"
+    return PUZZLE_DIR / f"{on.isoformat()}{suffix}.json"
 
 
 def _write_atomic(path: Path, data: dict) -> None:
@@ -117,33 +138,36 @@ def _write_atomic(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _sample_puzzle(on: date) -> Puzzle:
+def _sample_puzzle(on: date, category: str = news.TOP) -> Puzzle:
     pool = [_round_from(r) for r in json.loads(SAMPLES_FILE.read_text())]
     offset = ((on - LAUNCH_DATE).days * ROUNDS_PER_DAY) % len(pool)
     rounds = [pool[(offset + i) % len(pool)] for i in range(ROUNDS_PER_DAY)]
-    return Puzzle(date=on, news_date=on - timedelta(days=1), rounds=rounds, sample=True)
+    return Puzzle(date=on, news_date=on - timedelta(days=1), rounds=rounds, sample=True, category=category)
 
 
-def load_puzzle(on: date, generate: bool = True) -> Puzzle:
-    """The puzzle for a day.
+def load_puzzle(on: date, category: str = news.TOP, generate: bool = True) -> Puzzle:
+    """The puzzle for a day in one category.
 
-    1. puzzles/YYYY-MM-DD.json if it exists (hand-written or generated earlier).
+    1. The saved puzzle file if it exists (hand-written or generated earlier).
     2. Otherwise build one from the previous day's headlines and save it, so
        every player gets the same rounds.
     3. If the feeds fail, fall back to the sample pool.
     """
-    path = PUZZLE_DIR / f"{on.isoformat()}.json"
+    if category not in news.CATEGORIES:
+        raise KeyError(category)
+    path = puzzle_path(on, category)
+    key = (category, on)
 
     if not path.exists() and generate:
-        recently_failed = time.time() - _failed_at.get(on, 0) < RETRY_AFTER_SECONDS
+        recently_failed = time.time() - _failed_at.get(key, 0) < RETRY_AFTER_SECONDS
         if not recently_failed:
-            with _lock:
+            with _lock_for(key):
                 if not path.exists():  # another request may have just made it
-                    data = news.generate(on)
+                    data = news.generate(on, category)
                     if data:
                         _write_atomic(path, data)
                     else:
-                        _failed_at[on] = time.time()
+                        _failed_at[key] = time.time()
 
     if path.exists():
         data = json.loads(path.read_text())
@@ -151,8 +175,9 @@ def load_puzzle(on: date, generate: bool = True) -> Puzzle:
             date=on,
             news_date=date.fromisoformat(data["news_date"]),
             rounds=[_round_from(r) for r in data["rounds"]],
+            category=category,
         )
-    return _sample_puzzle(on)
+    return _sample_puzzle(on, category)
 
 
 # ---------- Guess checking ----------

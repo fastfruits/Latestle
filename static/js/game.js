@@ -1,32 +1,27 @@
 "use strict";
 
+// The server is the source of truth: it times every round, scores it, and
+// keeps this player's progress (tied to an anonymous cookie). The browser
+// just draws the countdown and asks the server what happened.
+
 // ---------- Helpers ----------
 
 const $ = (id) => document.getElementById(id);
 const REDACTED = "[REDACTED]";
 const FAST_MS = 7000; // a 🟩 instead of a 🟨
-const HINT_AT_MS = 10000; // show the extra hint after this long
+const HINT_AT_MS = 10000; // the server releases the hint after this long
 
 function localDateISO(d = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-const store = {
-  get(key, fallback) {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : fallback;
-    } catch {
-      return fallback;
-    }
+const prefs = {
+  get(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
   },
   set(key, value) {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch {
-      /* private mode etc. – the game still works, it just won't persist */
-    }
+    try { localStorage.setItem(key, value); } catch { /* fine without it */ }
   },
 };
 
@@ -34,7 +29,7 @@ async function api(path, payload) {
   const res = await fetch(path, payload === undefined ? {} : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ date: today, category, ...payload }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
@@ -58,41 +53,34 @@ function shake(el) {
 
 const fmtSeconds = (ms) => (ms / 1000).toFixed(1);
 const fmtPoints = (n) => n.toLocaleString();
+const isDone = (r) => r.status === "correct" || r.status === "missed";
 
 // ---------- State ----------
 
 const today = localDateISO();
-const GAME_KEY = `latestle:v2:game:${today}`;
-const STATS_KEY = "latestle:v2:stats";
+// Which edition: the main "top" puzzle, or a category like ?category=science.
+const category = new URLSearchParams(location.search).get("category") || "top";
+const query = `date=${today}&category=${encodeURIComponent(category)}`;
 
-let puzzle = null; // public puzzle from the server
-let game = null; // this player's progress today, saved to localStorage
+let meta = null; // { number, category, category_name, news_date, round_seconds, total_rounds, sample }
+let categories = []; // [{ slug, name }] for the edition picker
+let rounds = []; // one entry per round, as the server describes it
+let result = null; // { score, players, average, beat_pct } once the day is done
+let current = 0;
+let startedAt = 0; // local clock time the current round started
 let busy = false;
+let hintRequested = false;
 let frame = null;
 
-function newGame() {
-  return {
-    phase: "intro", // intro | playing | between | done
-    current: 0,
-    rounds: puzzle.rounds.map(() => ({
-      status: "pending", // pending | playing | correct | missed
-      startedAt: null,
-      timeMs: null,
-      points: 0,
-      guesses: [],
-      reveal: null,
-    })),
-  };
-}
+const roundMs = () => meta.round_seconds * 1000;
+const totalScore = () => rounds.reduce((sum, r) => sum + (r.points || 0), 0);
 
-const save = () => store.set(GAME_KEY, game);
-const roundMs = () => puzzle.round_seconds * 1000;
-const totalScore = () => game.rounds.reduce((sum, r) => sum + r.points, 0);
-
-function pointsFor(timeMs) {
-  // 100 for getting it, plus up to 200 for speed.
-  const left = Math.max(0, 1 - timeMs / roundMs());
-  return 100 + Math.round(200 * left);
+function setRound(view) {
+  rounds[view.index] = view;
+  if (view.status === "playing") {
+    // Use the server's elapsed time, so the countdown matches its clock.
+    startedAt = Date.now() - view.elapsed_ms;
+  }
 }
 
 // ---------- Rendering helpers ----------
@@ -117,19 +105,19 @@ function headlineNodes(text, { cells = null, answer = null, status = null } = {}
 }
 
 /** Letter cells for the blank, showing what the player has typed so far. */
-function buildCells(roundInfo, typed) {
+function buildCells(r, typed) {
   const wrap = document.createElement("span");
   wrap.className = "slot";
-  wrap.setAttribute("aria-label", `${roundInfo.length} letters, starts with ${roundInfo.first_letter}`);
+  wrap.setAttribute("aria-label", `${r.length} letters, starts with ${r.first_letter}`);
   const letters = typed.replace(/[^\p{L}\p{N}]/gu, "").toUpperCase();
-  for (let i = 0; i < roundInfo.length; i++) {
+  for (let i = 0; i < r.length; i++) {
     const cell = document.createElement("span");
     cell.className = "cell";
     if (letters[i]) {
       cell.textContent = letters[i];
       cell.classList.add("filled");
     } else if (i === 0) {
-      cell.textContent = roundInfo.first_letter;
+      cell.textContent = r.first_letter;
       cell.classList.add("hint");
     }
     wrap.append(cell);
@@ -138,7 +126,7 @@ function buildCells(roundInfo, typed) {
 }
 
 function squareFor(r) {
-  if (r.status === "correct") return r.timeMs <= FAST_MS ? "fast" : "slow";
+  if (r.status === "correct") return r.time_ms <= FAST_MS ? "fast" : "slow";
   if (r.status === "missed") return "miss";
   return "";
 }
@@ -147,61 +135,82 @@ function squareFor(r) {
 
 function show(section) {
   for (const id of ["intro", "play", "summary"]) $(id).hidden = id !== section;
+  // Switching editions mid-round would just burn the clock, so hide it then.
+  $("editions").hidden = section === "play";
+}
+
+function renderEditions() {
+  const nav = $("editions");
+  nav.replaceChildren();
+  categories.forEach((c) => {
+    const a = document.createElement("a");
+    a.className = "edition";
+    a.textContent = c.name;
+    a.href = c.slug === "top" ? "/" : `/?category=${encodeURIComponent(c.slug)}`;
+    if (c.slug === meta.category) a.setAttribute("aria-current", "page");
+    nav.append(a);
+  });
 }
 
 function renderIntro() {
   show("intro");
-  const newsDate = new Date(`${puzzle.news_date}T12:00:00`);
+  $("intro-kicker").textContent = meta.category === "top"
+    ? "Yesterday's news"
+    : `Yesterday's news · ${meta.category_name}`;
+  const newsDate = new Date(`${meta.news_date}T12:00:00`);
   $("news-date").textContent = newsDate.toLocaleDateString(undefined, {
     weekday: "long", month: "long", day: "numeric",
   });
-  $("rule-rounds").textContent = puzzle.rounds.length;
-  $("rule-seconds").textContent = puzzle.round_seconds;
-  $("sample-badge").hidden = !puzzle.sample;
+  $("rule-rounds").textContent = meta.total_rounds;
+  $("rule-seconds").textContent = meta.round_seconds;
+  $("sample-badge").hidden = !meta.sample;
   $("start-btn").focus();
+}
+
+function renderHint(r) {
+  const el = $("headline-hint");
+  // Done rounds only show the hint if the player got that far.
+  const show = r.hint && (r.status === "playing" || r.time_ms >= HINT_AT_MS);
+  el.hidden = !show;
+  if (!show) return;
+  const label = document.createElement("strong");
+  label.textContent = "Hint: ";
+  el.replaceChildren(label, isDone(r)
+    ? headlineNodes(r.hint, { answer: r.reveal.answer, status: r.status })
+    : headlineNodes(r.hint, { cells: buildCells(r, "") }));
+}
+
+function renderHeadline(r) {
+  $("headline").replaceChildren(isDone(r)
+    ? headlineNodes(r.headline, { answer: r.reveal.answer, status: r.status })
+    : headlineNodes(r.headline, { cells: buildCells(r, $("guess-input").value) }));
 }
 
 function renderRound() {
   show("play");
-  const i = game.current;
-  const r = game.rounds[i];
-  const info = puzzle.rounds[i];
-  const over = r.status === "correct" || r.status === "missed";
+  const r = rounds[current];
+  const over = isDone(r);
 
-  $("round-label").textContent = `Headline ${i + 1} of ${puzzle.rounds.length}`;
+  $("round-label").textContent = `Headline ${current + 1} of ${meta.total_rounds}`;
   $("score").textContent = fmtPoints(totalScore());
-  $("headline-source").textContent = over && r.reveal?.source ? r.reveal.source : "";
-
-  const headline = $("headline");
-  if (over) {
-    headline.replaceChildren(headlineNodes(info.headline, { answer: r.reveal?.answer ?? "?", status: r.status }));
-  } else {
-    headline.replaceChildren(headlineNodes(info.headline, { cells: buildCells(info, $("guess-input").value) }));
-  }
+  $("headline-source").textContent = over ? r.reveal.source : "";
+  renderHeadline(r);
+  renderHint(r);
 
   $("tried").textContent = r.guesses.length ? `Tried: ${r.guesses.join(", ")}` : "";
   $("guess-form").hidden = over;
   $("round-result").hidden = !over;
-  $("headline-card").classList.toggle("is-correct", r.status === "correct");
-  $("headline-card").classList.toggle("is-missed", r.status === "missed");
 
   if (over) {
+    stopTimer();
+    setTimer(r.status === "correct" ? roundMs() - r.time_ms : 0);
     $("round-verdict").textContent = r.status === "correct"
-      ? `+${r.points} points · ${fmtSeconds(r.timeMs)}s`
-      : r.timeMs >= roundMs() ? "Time's up" : "Passed";
+      ? `+${r.points} points · ${fmtSeconds(r.time_ms)}s`
+      : r.time_ms >= roundMs() ? "Time's up" : "Passed";
     $("round-verdict").classList.toggle("good", r.status === "correct");
-    // Fill the answer into the hint too, if it was showing.
-    const hint = $("headline-hint");
-    if (!hint.hidden && info.hint && r.reveal) {
-      const label = document.createElement("strong");
-      label.textContent = "Hint: ";
-      hint.replaceChildren(label, headlineNodes(info.hint, { answer: r.reveal.answer, status: r.status }));
-    }
-    const last = i === puzzle.rounds.length - 1;
+    const last = current === meta.total_rounds - 1;
     $("next-btn").textContent = last ? "See your results" : "Next headline";
     $("next-btn").focus();
-    stopTimer();
-    setTimer(r.status === "correct" ? roundMs() - r.timeMs : 0);
   }
 }
 
@@ -212,25 +221,30 @@ function setTimer(remaining) {
   $("timer-text").textContent = fmtSeconds(Math.max(0, remaining));
 }
 
-function showHint(visible) {
-  const hint = puzzle.rounds[game.current].hint;
-  const el = $("headline-hint");
-  el.hidden = !(visible && hint);
-  if (!el.hidden && !el.childNodes.length) {
-    const label = document.createElement("strong");
-    label.textContent = "Hint: ";
-    el.replaceChildren(label, headlineNodes(hint, { cells: buildCells(puzzle.rounds[game.current], "") }));
+function renderResultLine() {
+  const el = $("result-line");
+  if (!result) {
+    el.textContent = "";
+    return;
+  }
+  if (result.beat_pct === null) {
+    el.textContent = "You're the first to finish today. Check back later to see how you compare!";
+  } else {
+    const players = `${fmtPoints(result.players)} players`;
+    el.textContent = `You beat ${result.beat_pct}% of players today · ${players} · average ${fmtPoints(result.average)}`;
   }
 }
 
 function renderSummary() {
   show("summary");
   stopTimer();
+  $("summary-kicker").textContent = meta.category === "top" ? "Final score" : `Final score · ${meta.category_name}`;
   $("final-score").textContent = fmtPoints(totalScore());
+  renderResultLine();
 
   const squares = $("final-squares");
   squares.replaceChildren();
-  game.rounds.forEach((r) => {
+  rounds.forEach((r) => {
     const sq = document.createElement("span");
     sq.className = `sq sq-${squareFor(r)}`;
     squares.append(sq);
@@ -238,9 +252,8 @@ function renderSummary() {
 
   const list = $("stories");
   list.replaceChildren();
-  game.rounds.forEach((r, i) => {
-    const info = puzzle.rounds[i];
-    const rev = r.reveal || {};
+  rounds.forEach((r) => {
+    const rev = r.reveal;
     const li = document.createElement("li");
     li.className = "story";
 
@@ -250,13 +263,12 @@ function renderSummary() {
     sq.className = `sq sq-${squareFor(r)}`;
     const metaText = document.createElement("span");
     metaText.textContent = r.status === "correct"
-      ? `${fmtSeconds(r.timeMs)}s · +${r.points} pts`
+      ? `${fmtSeconds(r.time_ms)}s · +${r.points} pts`
       : "Missed · 0 pts";
     meta.append(sq, metaText);
 
     const h = document.createElement("h3");
-    h.append(headlineNodes(info.headline, { answer: rev.answer ?? "?", status: r.status }));
-
+    h.append(headlineNodes(r.headline, { answer: rev.answer, status: r.status }));
     li.append(meta, h);
 
     if (rev.summary) {
@@ -279,10 +291,20 @@ function renderSummary() {
   startCountdown();
 }
 
+/** Pick the right screen for wherever the player is in their day. */
 function render() {
-  if (game.phase === "intro") renderIntro();
-  else if (game.phase === "done") renderSummary();
-  else renderRound();
+  const playing = rounds.findIndex((r) => r.status === "playing");
+  const doneCount = rounds.filter(isDone).length;
+
+  if (doneCount === rounds.length) return renderSummary();
+  if (playing >= 0) {
+    current = playing;
+    return resumeRound();
+  }
+  if (doneCount === 0) return renderIntro();
+  // Between rounds: show the last finished one with its Next button.
+  current = doneCount - 1;
+  renderRound();
 }
 
 // ---------- Timer ----------
@@ -293,63 +315,76 @@ function stopTimer() {
 }
 
 function tick() {
-  const r = game.rounds[game.current];
-  const elapsed = Date.now() - r.startedAt;
-  const remaining = roundMs() - elapsed;
-  setTimer(remaining);
-  showHint(elapsed >= HINT_AT_MS);
+  const r = rounds[current];
+  if (r.status !== "playing") return;
+  const elapsed = Date.now() - startedAt;
+  setTimer(roundMs() - elapsed);
 
-  if (remaining <= 0) {
-    // Let an in-flight guess finish first; it was typed before the buzzer.
-    if (!busy) endRound("missed");
-    else frame = requestAnimationFrame(tick);
-    return;
+  if (elapsed >= HINT_AT_MS && !r.hint && !hintRequested) fetchHint();
+
+  if (elapsed >= roundMs()) {
+    // Let an in-flight guess land first; it was sent before the buzzer.
+    if (!busy) return endRound();
   }
   frame = requestAnimationFrame(tick);
 }
 
-function startRound() {
-  const r = game.rounds[game.current];
-  if (r.status === "pending") {
-    r.status = "playing";
-    r.startedAt = Date.now();
-    game.phase = "playing";
-    save();
+async function fetchHint() {
+  hintRequested = true;
+  try {
+    const view = await api("/api/round/hint", { round: current });
+    if (view.hint && rounds[current].status === "playing") {
+      rounds[current].hint = view.hint;
+      renderHint(rounds[current]);
+    } else {
+      setTimeout(() => (hintRequested = false), 500); // clocks slightly apart; try again
+    }
+  } catch {
+    hintRequested = false;
   }
+}
+
+function resumeRound() {
+  hintRequested = false;
   $("guess-input").value = "";
-  $("headline-hint").replaceChildren();
-  $("headline-hint").hidden = true;
   renderRound();
   stopTimer();
   frame = requestAnimationFrame(tick);
   $("guess-input").focus();
 }
 
-async function endRound(status, { timeMs = null, reveal = null } = {}) {
-  const r = game.rounds[game.current];
-  if (r.status !== "playing") return;
-  stopTimer();
-  r.status = status;
-  r.timeMs = timeMs ?? Math.min(Date.now() - r.startedAt, roundMs());
-  r.points = status === "correct" ? pointsFor(r.timeMs) : 0;
-  game.phase = "between";
-  save();
-
-  if (!reveal) {
-    try {
-      reveal = (await api("/api/reveal", { date: today, round: game.current })).reveal;
-    } catch (err) {
-      toast(err.message);
-    }
+async function startRound(index) {
+  if (busy) return;
+  busy = true;
+  try {
+    current = index;
+    setRound(await api("/api/round/start", { round: index }));
+    if (isDone(rounds[index])) renderRound();
+    else resumeRound();
+  } catch (err) {
+    toast(err.message);
+    await resync();
+  } finally {
+    busy = false;
   }
-  r.reveal = reveal;
-  save();
-  renderRound();
-  if (status === "correct") toast(r.timeMs <= FAST_MS ? "Lightning fast! ⚡" : "Got it!");
+}
+
+async function endRound() {
+  stopTimer();
+  busy = true;
+  try {
+    setRound(await api("/api/round/end", { round: current }));
+    renderRound();
+  } catch (err) {
+    toast(err.message);
+    await resync();
+  } finally {
+    busy = false;
+  }
 }
 
 async function submitGuess() {
-  const r = game.rounds[game.current];
+  const r = rounds[current];
   const input = $("guess-input");
   const guess = input.value.trim();
   if (busy || r.status !== "playing" || !guess) return;
@@ -360,71 +395,72 @@ async function submitGuess() {
     return;
   }
 
-  // Time is measured when the player hits Enter, not when the server replies.
-  const timeMs = Date.now() - r.startedAt;
   busy = true;
   try {
-    const res = await api("/api/guess", { date: today, round: game.current, guess });
-    if (res.correct && timeMs <= roundMs()) {
-      await endRound("correct", { timeMs, reveal: res.reveal });
-      return;
+    const res = await api("/api/round/guess", { round: current, guess });
+    const hint = r.hint;
+    setRound(res.round);
+    if (!rounds[current].hint && hint) rounds[current].hint = hint; // keep a hint we already have
+
+    if (res.correct) {
+      renderRound();
+      toast(res.round.time_ms <= FAST_MS ? "Lightning fast! ⚡" : "Got it!");
+    } else if (isDone(res.round)) {
+      renderRound(); // the buzzer beat the guess
+    } else {
+      // Only clear what was submitted; the player may already be typing again.
+      if (input.value.trim() === guess) input.value = "";
+      shake(input);
+      if (res.close) toast("So close…");
+      renderHeadline(rounds[current]);
+      $("tried").textContent = `Tried: ${rounds[current].guesses.join(", ")}`;
     }
-    r.guesses.push(guess);
-    save();
-    // Only clear what was submitted; the player may already be typing again.
-    if (input.value.trim() === guess) input.value = "";
-    shake(input);
-    if (res.close) toast("So close…");
-    renderRound();
   } catch (err) {
     toast(err.message);
   } finally {
     busy = false;
-    if (game.rounds[game.current].status === "playing") input.focus();
+    if (rounds[current].status === "playing") input.focus();
   }
 }
 
-function nextRound() {
-  if (game.current < puzzle.rounds.length - 1) {
-    game.current += 1;
-    save();
-    startRound();
-  } else {
-    game.phase = "done";
-    save();
-    recordStats();
-    renderSummary();
-    setTimeout(openStats, 900);
-  }
+async function nextRound() {
+  if (current < meta.total_rounds - 1) return startRound(current + 1);
+  await resync(); // picks up the final result and percentile
+  setTimeout(openStats, 900);
+}
+
+/** Reload everything from the server and redraw. */
+async function resync() {
+  const state = await api(`/api/state?${query}`);
+  meta = state.puzzle;
+  categories = state.categories || [];
+  renderEditions();
+  rounds = state.rounds;
+  result = state.result || null;
+  const playing = rounds.find((r) => r.status === "playing");
+  if (playing) setRound(playing);
+  render();
 }
 
 // ---------- Stats ----------
 
-function recordStats() {
-  const stats = store.get(STATS_KEY, { played: 0, total: 0, best: 0, streak: 0, maxStreak: 0, last: null, recent: [] });
-  const score = totalScore();
-  stats.played += 1;
-  stats.total += score;
-  stats.best = Math.max(stats.best, score);
-  stats.streak = stats.last === puzzle.number - 1 ? stats.streak + 1 : 1;
-  stats.maxStreak = Math.max(stats.maxStreak, stats.streak);
-  stats.last = puzzle.number;
-  stats.recent = [...stats.recent, { number: puzzle.number, score }].slice(-7);
-  store.set(STATS_KEY, stats);
-}
-
-function openStats() {
-  const stats = store.get(STATS_KEY, null) || { played: 0, total: 0, best: 0, streak: 0, last: null, recent: [] };
-  const streakAlive = stats.last !== null && puzzle && puzzle.number - stats.last <= 1;
+async function openStats() {
+  let stats;
+  try {
+    stats = await api(`/api/stats?${query}`);
+  } catch (err) {
+    return toast(err.message);
+  }
   $("stat-played").textContent = stats.played;
   $("stat-best").textContent = fmtPoints(stats.best);
-  $("stat-avg").textContent = stats.played ? fmtPoints(Math.round(stats.total / stats.played)) : 0;
-  $("stat-streak").textContent = streakAlive ? stats.streak : 0;
+  $("stat-avg").textContent = fmtPoints(stats.average);
+  $("stat-streak").textContent = stats.streak;
+  $("stats-edition").textContent = meta?.category_name || "";
 
   const recent = $("recent");
   recent.replaceChildren();
+  if (!stats.recent.length) recent.textContent = "Finish a day to see your scores here.";
   const max = Math.max(1, ...stats.recent.map((r) => r.score));
-  if (!stats.recent.length) recent.textContent = "Play a day to see your scores here.";
   stats.recent.forEach((r) => {
     const row = document.createElement("div");
     row.className = "dist-row";
@@ -432,7 +468,7 @@ function openStats() {
     label.textContent = `#${r.number}`;
     const bar = document.createElement("span");
     bar.className = "dist-bar";
-    if (r.number === puzzle?.number) bar.classList.add("today");
+    if (r.date === today) bar.classList.add("today");
     bar.style.width = `${Math.max(12, (100 * r.score) / max)}%`;
     bar.textContent = fmtPoints(r.score);
     row.append(label, bar);
@@ -445,10 +481,13 @@ function openStats() {
 
 function shareText() {
   const emoji = { fast: "🟩", slow: "🟨", miss: "🟥" };
-  const squares = game.rounds.map((r) => emoji[squareFor(r)] || "⬜").join("");
-  const times = game.rounds.filter((r) => r.status === "correct").map((r) => r.timeMs);
+  const squares = rounds.map((r) => emoji[squareFor(r)] || "⬜").join("");
+  const times = rounds.filter((r) => r.status === "correct").map((r) => r.time_ms);
   const fastest = times.length ? `\n⚡ Fastest: ${fmtSeconds(Math.min(...times))}s` : "";
-  return `Latestle #${puzzle.number} · ${fmtPoints(totalScore())} pts\n${squares}${fastest}\n${location.origin}`;
+  const beat = result?.beat_pct != null ? `\nBeat ${result.beat_pct}% of players` : "";
+  const edition = meta.category === "top" ? "" : ` ${meta.category_name}`;
+  const link = meta.category === "top" ? location.origin : `${location.origin}/?category=${meta.category}`;
+  return `Latestle #${meta.number}${edition} · ${fmtPoints(totalScore())} pts\n${squares}${fastest}${beat}\n${link}`;
 }
 
 async function share() {
@@ -489,19 +528,16 @@ async function init() {
   $("help-btn").addEventListener("click", () => $("help-dialog").showModal());
   $("stats-btn").addEventListener("click", openStats);
   $("share-btn").addEventListener("click", share);
-  $("start-btn").addEventListener("click", startRound);
+  $("start-btn").addEventListener("click", () => startRound(0));
   $("next-btn").addEventListener("click", nextRound);
-  $("pass-btn").addEventListener("click", () => endRound("missed"));
+  $("pass-btn").addEventListener("click", () => !busy && endRound());
   $("guess-form").addEventListener("submit", (e) => {
     e.preventDefault();
     submitGuess();
   });
   // Mirror typing into the letter cells in the headline.
   $("guess-input").addEventListener("input", () => {
-    if (game?.rounds[game.current].status === "playing") {
-      const info = puzzle.rounds[game.current];
-      $("headline").replaceChildren(headlineNodes(info.headline, { cells: buildCells(info, $("guess-input").value) }));
-    }
+    if (rounds[current]?.status === "playing") renderHeadline(rounds[current]);
   });
   document.querySelectorAll("dialog").forEach((d) =>
     d.addEventListener("click", (e) => e.target === d && d.close())
@@ -510,36 +546,24 @@ async function init() {
   // The first visit of the day may build the puzzle from the feeds.
   const loading = setTimeout(() => ($("loading").hidden = false), 300);
   try {
-    puzzle = await api(`/api/puzzle?date=${today}`);
+    await resync();
   } catch (err) {
-    clearTimeout(loading);
-    $("loading").hidden = true;
     $("dateline").textContent = "Couldn't load today's headlines";
     toast(err.message, 4000);
     return;
+  } finally {
+    clearTimeout(loading);
+    $("loading").hidden = true;
   }
-  clearTimeout(loading);
-  $("loading").hidden = true;
 
   const longDate = new Date(`${today}T12:00:00`).toLocaleDateString(undefined, {
     weekday: "long", year: "numeric", month: "long", day: "numeric",
   });
-  $("dateline").textContent = `No. ${puzzle.number} · ${longDate}`;
+  $("dateline").textContent = `No. ${meta.number} · ${longDate}`;
 
-  game = store.get(GAME_KEY, null);
-  if (!game || game.rounds?.length !== puzzle.rounds.length) {
-    game = newGame();
-    save();
-  }
-
-  // Reloading doesn't pause the clock: resume the round where it stands
-  // (or end it, if its 20 seconds already ran out).
-  if (game.phase === "playing") startRound();
-  else render();
-
-  if (!store.get("latestle:seen-help", false)) {
+  if (!prefs.get("latestle:seen-help")) {
     $("help-dialog").showModal();
-    store.set("latestle:seen-help", true);
+    prefs.set("latestle:seen-help", "1");
   }
 }
 

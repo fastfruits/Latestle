@@ -3,8 +3,10 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from sqlalchemy import create_engine
+
 import app as app_module
-from latestle import news, puzzles
+from latestle import db, game, news, puzzles
 from latestle.news import Headline, build_rounds, proper_nouns, redact
 from latestle.puzzles import check_guess, load_puzzle, normalize, today_utc
 
@@ -36,17 +38,48 @@ HEADLINES = [
 @pytest.fixture
 def fake_news(tmp_path, monkeypatch):
     """No network in tests: feeds return HEADLINES, puzzles go to a temp dir."""
-    monkeypatch.setattr(news, "fetch_all", lambda: list(HEADLINES))
+    monkeypatch.setattr(news, "fetch_all", lambda feeds=None: list(HEADLINES))
     monkeypatch.setattr(news, "from_day", lambda hs, day: hs)
     monkeypatch.setattr(puzzles, "PUZZLE_DIR", tmp_path)
     puzzles._failed_at.clear()
     return tmp_path
 
 
+class Clock:
+    """Stands in for the server clock so tests can skip ahead in time."""
+
+    def __init__(self):
+        self.ms = 1_800_000_000_000
+
+    def __call__(self):
+        return self.ms
+
+    def advance(self, seconds):
+        self.ms += int(seconds * 1000)
+
+
 @pytest.fixture
-def client(fake_news):
+def clock(monkeypatch):
+    c = Clock()
+    monkeypatch.setattr(game, "now_ms", c)
+    return c
+
+
+@pytest.fixture
+def fresh_db():
+    db.use(create_engine("sqlite://"))
+
+
+@pytest.fixture
+def new_player(fake_news, fresh_db, clock):
+    """Each call returns a browser with its own anonymous player cookie."""
     app_module.app.config["TESTING"] = True
-    return app_module.app.test_client()
+    return app_module.app.test_client
+
+
+@pytest.fixture
+def client(new_player):
+    return new_player()
 
 
 # ---------- picking answers ----------
@@ -89,6 +122,23 @@ def test_sentence_start_only_words_are_not_answers():
     assert "Government" not in answers and "Relocation" not in answers
 
 
+def test_title_case_headlines_dont_create_names():
+    assert news.is_title_case("It Is Time For Timor-Leste to Acknowledge the Victims")
+    assert not news.is_title_case("Jensen Huang says he would be honoured to return as Nvidia CEO")
+    title_case = h("It Is Time For Leaders to Acknowledge the Victims of the Massacre", source="The Diplomat")
+    assert "Acknowledge" not in {r["answer"] for r in build_rounds(HEADLINES + [title_case])}
+
+
+def test_category_puzzles_are_saved_separately(fake_news):
+    load_puzzle(date(2026, 11, 17))
+    p = load_puzzle(date(2026, 11, 17), "science")
+    assert p.category == "science" and p.meta()["category_name"] == "Science"
+    assert (fake_news / "2026-11-17.json").exists()
+    assert (fake_news / "2026-11-17-science.json").exists()
+    with pytest.raises(KeyError):
+        load_puzzle(date(2026, 11, 17), "nope")
+
+
 # ---------- matching ----------
 
 def test_normalize():
@@ -125,12 +175,12 @@ def test_generates_once_and_saves(fake_news, monkeypatch):
     assert (fake_news / "2026-11-17.json").exists()
 
     # Second load reads the file instead of fetching again.
-    monkeypatch.setattr(news, "fetch_all", lambda: pytest.fail("should not refetch"))
+    monkeypatch.setattr(news, "fetch_all", lambda *a: pytest.fail("should not refetch"))
     assert [r.answer for r in load_puzzle(date(2026, 11, 17)).rounds] == [r.answer for r in p.rounds]
 
 
 def test_falls_back_to_samples_when_feeds_fail(fake_news, monkeypatch):
-    monkeypatch.setattr(news, "fetch_all", lambda: [])
+    monkeypatch.setattr(news, "fetch_all", lambda *a: [])
     p = load_puzzle(date(2026, 11, 18))
     assert p.sample and len(p.rounds) == 5
 
@@ -151,31 +201,149 @@ def today():
     return today_utc().isoformat()
 
 
-def test_puzzle_endpoint_hides_answers(client):
-    data = client.get(f"/api/puzzle?date={today()}").get_json()
-    assert len(data["rounds"]) == 5 and data["round_seconds"] == 20
-    first = data["rounds"][0]
-    assert set(first) == {"headline", "length", "first_letter", "hint"}
-    answers = [r.answer for r in load_puzzle(today_utc()).rounds]
-    dumped = json.dumps(data)
-    for a in answers:
-        assert f'"{a}"' not in dumped and f" {a} " not in dumped
+def answers():
+    return [r.answer for r in load_puzzle(today_utc()).rounds]
 
 
-def test_guess_and_reveal(client):
-    answer = load_puzzle(today_utc()).rounds[0].answer
-    wrong = client.post("/api/guess", json={"date": today(), "round": 0, "guess": "zzzz"}).get_json()
-    assert wrong == {"correct": False, "close": False}
+def call(client, action, round_, **extra):
+    res = client.post(f"/api/round/{action}", json={"date": today(), "round": round_, **extra})
+    return res.status_code, res.get_json()
 
-    right = client.post("/api/guess", json={"date": today(), "round": 0, "guess": answer.lower()}).get_json()
-    assert right["correct"] and right["reveal"]["answer"] == answer and right["reveal"]["url"]
 
-    reveal = client.post("/api/reveal", json={"date": today(), "round": 1}).get_json()["reveal"]
-    assert reveal["answer"] and reveal["original"]
+def play_day(client, clock, seconds_each, correct=True):
+    for i, answer in enumerate(answers()):
+        call(client, "start", i)
+        clock.advance(seconds_each)
+        if correct:
+            call(client, "guess", i, guess=answer)
+        else:
+            call(client, "end", i)
+
+
+def test_new_visitors_get_an_anonymous_cookie(client):
+    res = client.get(f"/api/state?date={today()}")
+    cookie = res.headers["Set-Cookie"]
+    assert cookie.startswith("latestle_player=") and "HttpOnly" in cookie
+    # Already has one: not set again.
+    assert "Set-Cookie" not in client.get(f"/api/state?date={today()}").headers
+
+
+def test_state_has_no_headlines_before_rounds_start(client):
+    state = client.get(f"/api/state?date={today()}").get_json()
+    assert state["puzzle"]["total_rounds"] == 5 and state["puzzle"]["round_seconds"] == 20
+    assert all(r == {"index": i, "status": "pending"} for i, r in enumerate(state["rounds"]))
+    assert "result" not in state
+
+
+def test_start_reveals_headline_but_not_answer_or_hint(client):
+    _, view = call(client, "start", 0)
+    assert view["status"] == "playing" and "[REDACTED]" in view["headline"]
+    assert view["hint"] is None and "reveal" not in view
+    assert answers()[0] not in json.dumps(view)
+
+
+def test_rounds_must_be_played_in_order(client):
+    status, body = call(client, "start", 1)
+    assert status == 400 and "earlier" in body["error"]
+
+
+def test_restarting_a_round_does_not_reset_the_clock(client, clock):
+    call(client, "start", 0)
+    clock.advance(8)
+    _, view = call(client, "start", 0)
+    assert view["elapsed_ms"] == 8000
+
+
+def test_hint_only_after_ten_seconds(client, clock):
+    call(client, "start", 0)
+    clock.advance(5)
+    assert call(client, "hint", 0)[1]["hint"] is None
+    clock.advance(5)
+    assert call(client, "hint", 0)[1]["hint"]
+
+
+def test_server_times_and_scores_correct_guess(client, clock):
+    call(client, "start", 0)
+    clock.advance(5)
+    _, wrong = call(client, "guess", 0, guess="zzzz")
+    assert not wrong["correct"] and wrong["round"]["guesses"] == ["zzzz"]
+    clock.advance(1)
+    _, right = call(client, "guess", 0, guess=answers()[0].lower())
+    assert right["correct"]
+    assert right["round"]["time_ms"] == 6000
+    assert right["round"]["points"] == game.points_for(6000) == 240
+    assert right["round"]["reveal"]["answer"] == answers()[0]
+
+
+def test_late_guess_does_not_count(client, clock):
+    call(client, "start", 0)
+    clock.advance(25)
+    _, res = call(client, "guess", 0, guess=answers()[0])
+    assert not res["correct"] and res["round"]["status"] == "missed" and res["round"]["time_ms"] == 20000
+
+
+def test_guess_just_after_buzzer_counts_for_minimum_points(client, clock):
+    call(client, "start", 0)
+    clock.advance(20.5)  # within the network grace period
+    _, res = call(client, "guess", 0, guess=answers()[0])
+    assert res["correct"] and res["round"]["points"] == 100
+
+
+def test_passing_reveals_answer(client, clock):
+    call(client, "start", 0)
+    clock.advance(3)
+    _, view = call(client, "end", 0)
+    assert view["status"] == "missed" and view["time_ms"] == 3000 and view["reveal"]["url"]
+
+
+def test_finished_day_compares_players_and_tracks_stats(new_player, clock):
+    alice, bob = new_player(), new_player()
+    play_day(alice, clock, seconds_each=2)
+    a = alice.get(f"/api/state?date={today()}").get_json()["result"]
+    assert a["players"] == 1 and a["beat_pct"] is None and a["score"] == 5 * game.points_for(2000)
+
+    play_day(bob, clock, seconds_each=1, correct=False)
+    b = bob.get(f"/api/state?date={today()}").get_json()["result"]
+    assert b == {"score": 0, "players": 2, "average": a["score"] // 2, "beat_pct": 0}
+    assert alice.get(f"/api/state?date={today()}").get_json()["result"]["beat_pct"] == 100
+
+    stats = alice.get(f"/api/stats?date={today()}").get_json()
+    assert stats["played"] == 1 and stats["best"] == a["score"] and stats["streak"] == 1
+    assert stats["recent"][0]["score"] == a["score"]
+
+
+def test_streaks(fresh_db, clock):
+    with db.engine().begin() as conn:
+        game.ensure_player(conn, "p")
+        for d, score in [("2026-11-10", 100), ("2026-11-12", 200), ("2026-11-13", 300), ("2026-11-14", 400)]:
+            conn.execute(db.results.insert().values(
+                player_id="p", puzzle_date=d, category="top", score=score, correct=1, finished_at=0))
+        conn.execute(db.results.insert().values(
+            player_id="p", puzzle_date="2026-11-15", category="science", score=999, correct=5, finished_at=0))
+        s = game.player_stats(conn, "p", date(2026, 11, 15), "top")
+        assert (s["streak"], s["best_streak"], s["played"], s["average"]) == (3, 3, 4, 250)
+        assert game.player_stats(conn, "p", date(2026, 11, 16), "top")["streak"] == 0
+        assert game.player_stats(conn, "p", date(2026, 11, 15), "science")["best"] == 999
 
 
 def test_bad_requests(client):
     future = (today_utc() + timedelta(days=3)).isoformat()
-    assert client.get(f"/api/puzzle?date={future}").status_code == 400
-    assert client.post("/api/guess", json={"date": today(), "round": 9, "guess": "x"}).status_code == 400
-    assert client.post("/api/reveal", json={"date": today(), "round": "x"}).status_code == 400
+    assert client.get(f"/api/state?date={future}").status_code == 400
+    assert call(client, "start", 9)[0] == 400
+    assert call(client, "guess", 0, guess="x")[0] == 400  # not started
+    assert client.post("/api/round/end", json={"date": today(), "round": "x"}).status_code == 400
+
+
+def test_each_category_is_its_own_game(client, clock):
+    call(client, "start", 0)
+    clock.advance(2)
+    call(client, "end", 0)
+    sci = client.get(f"/api/state?date={today()}&category=science").get_json()
+    assert sci["puzzle"]["category"] == "science"
+    assert all(r["status"] == "pending" for r in sci["rounds"])  # top's progress doesn't leak in
+    _, view = call(client, "start", 0, category="science")
+    assert view["status"] == "playing"
+    top = client.get(f"/api/state?date={today()}").get_json()
+    assert top["rounds"][0]["status"] == "missed"
+    assert {"slug": "science", "name": "Science"} in top["categories"]
+    assert client.get(f"/api/state?date={today()}&category=nope").status_code == 400
