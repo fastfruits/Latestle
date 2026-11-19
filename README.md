@@ -53,17 +53,37 @@ You can hand-edit a saved puzzle file and the server will use your version. Gene
 
 ## Players and saved progress
 
-There are no accounts. On a player's first visit the server gives them a random anonymous ID in a cookie (`latestle_player`, HttpOnly, kept for 2 years). Everything is saved on the server under that ID:
+Accounts are optional. On a player's first visit the server gives them a random anonymous ID in a cookie (`latestle_player`, HttpOnly, kept for 2 years). Everything is saved on the server under that ID:
 
 | Table | One row per | Holds |
 | --- | --- | --- |
-| `players` | player | the anonymous ID and when it was created |
+| `players` | player | the player ID and when it was created |
+| `users` | Google account | Google's account ID, email, name, picture, and the player ID that holds the account's progress |
 | `round_plays` | player, day, category, round | server start time, status, time taken, points, wrong guesses |
 | `results` | player, day, category | final score and number correct |
 
 From these the server works out each player's stats (played, best, average, current and best streak, last 7 scores) and how they compare with everyone else on the same puzzle ("You beat 72% of players today · 143 players · average 812"). Stats are kept separately per category.
 
-Clearing cookies or switching devices starts a fresh player. Optional sign-in, so progress follows people across devices, is the planned next step. Signing in would attach the anonymous history to the account.
+Without an account, clearing cookies or switching devices starts a fresh player.
+
+### Signing in with Google
+
+Players can sign in with Google (the person button at the top right) so their progress follows them to any device. An account owns one player ID, so the game works the same signed in or not:
+
+- **First sign-in:** the anonymous player on that browser becomes the account's player, so games already played come along.
+- **Signing in on another device:** that device's anonymous games are merged into the account. If the same puzzle was played on both, the account's copy is kept.
+- **Signing out:** the browser gets a brand-new anonymous ID, so a shared computer can't reach the account afterwards. An old anonymous ID that now belongs to an account only works while signed in.
+
+Who's signed in is kept in a signed session cookie (`latestle_session`, 1 year). The only Google data stored is the account ID, email, name and picture.
+
+**Setting it up**
+
+1. In the [Google Cloud console](https://console.cloud.google.com/apis/credentials), create a project. Set up the OAuth consent screen (app name, support email; the `openid`, `email` and `profile` scopes need no review).
+2. Create credentials → **OAuth client ID** → **Web application**. Under *Authorised redirect URIs* add `http://localhost:5001/auth/google/callback`, plus `https://<your-domain>/auth/google/callback` once deployed.
+3. Copy `.env.example` to `.env` and fill in `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. The app loads `.env` automatically, and `.env` is git-ignored.
+4. Restart the app. The sign-in button appears once both values are set. Without them the game runs as before, anonymous only.
+
+While the consent screen is in *Testing* mode, only Google accounts you add as test users can sign in. Publish it when you launch.
 
 By default the database is SQLite at `instance/latestle.db` (git-ignored, created automatically). For production, set `DATABASE_URL` to a Postgres URL and `pip install "psycopg[binary]"`. There are no migrations yet: if the table layout changes during development, delete `instance/latestle.db` and it will be recreated.
 
@@ -71,7 +91,8 @@ By default the database is SQLite at `instance/latestle.db` (git-ignored, create
 
 | Piece | Where |
 | --- | --- |
-| Flask server, player cookie, JSON API | `app.py` |
+| Flask server, player cookie, Google sign-in routes, JSON API | `app.py` |
+| Accounts: sign-in, linking and merging progress | `latestle/accounts.py` |
 | Fetching headlines and picking answers | `latestle/news.py` |
 | Loading or generating puzzles, checking guesses | `latestle/puzzles.py` |
 | Database tables | `latestle/db.py` |
@@ -94,12 +115,18 @@ The puzzle changes at the player's own midnight, because the browser sends its l
 
 ## Deploying
 
-The `Procfile` runs `gunicorn app:app`, which works on Render, Railway, Heroku and similar hosts. Use Postgres there (`DATABASE_URL`): a SQLite file on a temporary filesystem would lose every player's progress on restart. Likewise, a day's puzzle is rebuilt if the server restarts. Usually that gives the same rounds, but not always if the feeds changed in between. Saving puzzles to a database or storage bucket would fix that.
+The `Procfile` runs `gunicorn app:app`, which works on Render, Railway, Heroku and similar hosts. Set these there (see `.env.example`):
+
+- `DATABASE_URL`: use Postgres. A SQLite file on a temporary filesystem would lose every player's progress on restart.
+- `SECRET_KEY`: a long random value. Changing it signs everyone out.
+- `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with the production redirect URI added in Google's console.
+- `SECURE_COOKIES=1` (served over https) and `BEHIND_PROXY=1` (so the redirect to Google uses your real https address).
+ Likewise, a day's puzzle is rebuilt if the server restarts. Usually that gives the same rounds, but not always if the feeds changed in between. Saving puzzles to a database or storage bucket would fix that.
 
 ## Ideas for what's next
 
 - Use an LLM to pick the hidden word and write cleaner hints, instead of the capitalised-word heuristic.
-- Optional sign-in (email magic link or Google) so streaks follow players across devices.
+- More sign-in options (Apple, email magic link), and a way to delete your account.
 - A daily leaderboard. Rounds are already timed on the server, so scores can be trusted.
 - Multiple-choice mode for an even easier game.
 - A puzzle archive for past days.

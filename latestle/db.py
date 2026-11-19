@@ -1,7 +1,10 @@
 """Where player progress lives.
 
-Three tables:
-- players: one row per anonymous player (an ID kept in a browser cookie).
+Four tables:
+- players: one row per player ID. Anonymous visitors get one in a cookie;
+  an account owns exactly one.
+- users: Google accounts, each pointing at the player ID that holds its
+  progress.
 - round_plays: one row per round a player has started (per day and news
   category), with server-side start time, status, time taken and points.
 - results: one row per player per finished puzzle (day + category), used
@@ -39,6 +42,19 @@ players = Table(
     metadata,
     Column("id", String(32), primary_key=True),
     Column("created_at", BigInteger, nullable=False),  # epoch ms
+)
+
+users = Table(
+    "users",
+    metadata,
+    Column("id", String(32), primary_key=True),
+    Column("google_sub", String(255), nullable=False, unique=True),  # Google's stable account ID
+    Column("email", String(320)),
+    Column("name", String(255)),
+    Column("picture", Text),
+    Column("player_id", String(32), ForeignKey("players.id"), nullable=False, unique=True),
+    Column("created_at", BigInteger, nullable=False),
+    Column("last_login_at", BigInteger, nullable=False),
 )
 
 round_plays = Table(

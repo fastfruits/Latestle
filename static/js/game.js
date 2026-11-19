@@ -64,6 +64,7 @@ const query = `date=${today}&category=${encodeURIComponent(category)}`;
 
 let meta = null; // { number, category, category_name, news_date, round_seconds, total_rounds, sample }
 let categories = []; // [{ slug, name }] for the edition picker
+let account = { google_enabled: false, user: null }; // who's signed in, if anyone
 let rounds = []; // one entry per round, as the server describes it
 let result = null; // { score, players, average, beat_pct } once the day is done
 let current = 0;
@@ -135,8 +136,55 @@ function squareFor(r) {
 
 function show(section) {
   for (const id of ["intro", "play", "summary"]) $(id).hidden = id !== section;
-  // Switching editions mid-round would just burn the clock, so hide it then.
+  // Switching editions or signing in mid-round would just burn the clock,
+  // so hide those during a round.
   $("editions").hidden = section === "play";
+  $("account-btn").hidden = section === "play" || !account.google_enabled;
+}
+
+// ---------- Account ----------
+
+/** A profile picture, or the first letter of the name if there isn't one. */
+function avatarNodes(user) {
+  if (user.picture) {
+    const img = document.createElement("img");
+    img.src = user.picture;
+    img.alt = "";
+    img.referrerPolicy = "no-referrer"; // Google's image host refuses some referrers
+    return [img];
+  }
+  return [(user.name || user.email || "?").trim()[0].toUpperCase()];
+}
+
+function renderAccount() {
+  const user = account.user;
+  const btn = $("account-btn");
+  btn.hidden = !account.google_enabled || !$("play").hidden;
+  btn.setAttribute("aria-label", user ? `Account: ${user.name || user.email}` : "Sign in");
+  if (user) {
+    btn.replaceChildren(...avatarNodes(user));
+  } else {
+    btn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9Zm0 2c-4.4 0-8 2.2-8 5v2h16v-2c0-2.8-3.6-5-8-5Z"/></svg>';
+  }
+
+  $("account-signed-out").hidden = !!user;
+  $("account-signed-in").hidden = !user;
+  if (user) {
+    $("account-avatar").replaceChildren(...avatarNodes(user));
+    $("account-name").textContent = user.name || "";
+    $("account-email").textContent = user.email || "";
+  }
+  // Come back to this same page (and category) after signing in.
+  $("google-btn").href = `/auth/google?next=${encodeURIComponent(location.pathname + location.search)}`;
+  $("signin-nudge").hidden = !account.google_enabled || !!user;
+}
+
+async function logout() {
+  try {
+    await fetch("/auth/logout", { method: "POST" });
+  } finally {
+    location.reload();
+  }
 }
 
 function renderEditions() {
@@ -434,7 +482,9 @@ async function resync() {
   const state = await api(`/api/state?${query}`);
   meta = state.puzzle;
   categories = state.categories || [];
+  account = state.account || account;
   renderEditions();
+  renderAccount();
   rounds = state.rounds;
   result = state.result || null;
   const playing = rounds.find((r) => r.status === "playing");
@@ -527,6 +577,9 @@ function startCountdown() {
 async function init() {
   $("help-btn").addEventListener("click", () => $("help-dialog").showModal());
   $("stats-btn").addEventListener("click", openStats);
+  $("account-btn").addEventListener("click", () => $("account-dialog").showModal());
+  $("nudge-btn").addEventListener("click", () => $("account-dialog").showModal());
+  $("logout-btn").addEventListener("click", logout);
   $("share-btn").addEventListener("click", share);
   $("start-btn").addEventListener("click", () => startRound(0));
   $("next-btn").addEventListener("click", nextRound);

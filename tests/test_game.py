@@ -347,3 +347,108 @@ def test_each_category_is_its_own_game(client, clock):
     assert top["rounds"][0]["status"] == "missed"
     assert {"slug": "science", "name": "Science"} in top["categories"]
     assert client.get(f"/api/state?date={today()}&category=nope").status_code == 400
+
+
+# ---------- Google accounts ----------
+
+from latestle import accounts  # noqa: E402
+
+
+@pytest.fixture
+def google(monkeypatch):
+    """Pretend Google sign-in is configured, and answer the callback with
+    whichever Google account the test picks."""
+    app_module.app.config.update(GOOGLE_CLIENT_ID="test-id", GOOGLE_CLIENT_SECRET="test-secret")
+    who = {}
+    monkeypatch.setattr(app_module.oauth.google, "authorize_access_token", lambda **kw: {"userinfo": dict(who)})
+    yield who
+    app_module.app.config.update(GOOGLE_CLIENT_ID=None, GOOGLE_CLIENT_SECRET=None)
+
+
+def sign_in(client, google, sub="google-123", name="Ada Lovelace"):
+    google.update(sub=sub, name=name, email=f"{sub}@example.com", picture=None)
+    with client.session_transaction() as s:
+        s["next"] = "/?category=science"
+    return client.get("/auth/google/callback")
+
+
+def state(client, category="top"):
+    return client.get(f"/api/state?date={today()}&category={category}").get_json()
+
+
+def test_sign_in_disabled_without_google_settings(client):
+    assert state(client)["account"] == {"google_enabled": False, "user": None}
+    assert client.get("/auth/google").status_code == 404
+
+
+def test_first_sign_in_keeps_anonymous_progress(client, clock, google):
+    call(client, "start", 0)
+    call(client, "end", 0)
+    res = sign_in(client, google)
+    assert res.status_code == 302 and res.headers["Location"] == "/?category=science"
+    assert "latestle_player=" in res.headers.get("Set-Cookie", "")  # fresh ID for after sign-out
+
+    s = state(client)
+    assert s["account"]["user"]["name"] == "Ada Lovelace"
+    assert s["rounds"][0]["status"] == "missed"  # came with them
+
+
+def test_sign_out_starts_a_fresh_anonymous_player(client, clock, google):
+    call(client, "start", 0)
+    sign_in(client, google)
+    assert client.post("/auth/logout").get_json() == {"ok": True}
+    s = state(client)
+    assert s["account"]["user"] is None
+    assert s["rounds"][0]["status"] == "pending"
+
+
+def test_account_cookie_id_only_works_when_signed_in(client, clock, google):
+    sign_in(client, google)
+    call(client, "start", 0)
+    with db.engine().begin() as conn:
+        account_player = conn.execute(db.users.select()).mappings().one()["player_id"]
+    client.post("/auth/logout")
+    client.set_cookie("latestle_player", account_player)  # e.g. a stale cookie on a shared computer
+    assert state(client)["rounds"][0]["status"] == "pending"
+
+
+def test_signing_in_on_another_device_merges_progress(new_player, clock, google):
+    laptop, phone = new_player(), new_player()
+    sign_in(laptop, google)
+    call(laptop, "start", 0)
+    clock.advance(2)
+    call(laptop, "guess", 0, guess=answers()[0])
+
+    # The phone played the same top puzzle differently, plus a science one.
+    call(phone, "start", 0)
+    call(phone, "end", 0)
+    call(phone, "start", 0, category="science")
+    sign_in(phone, google)
+
+    top, sci = state(phone), state(phone, "science")
+    assert top["rounds"][0]["status"] == "correct"  # the account's copy wins
+    assert sci["rounds"][0]["status"] == "playing"  # moved over from the phone
+    assert state(laptop, "science")["rounds"][0]["status"] == "playing"
+
+
+def test_merge_players_unit(fresh_db, clock):
+    with db.engine().begin() as conn:
+        for pid in ("anon", "acct"):
+            game.ensure_player(conn, pid)
+        row = dict(puzzle_date="2026-11-18", score=100, correct=1, finished_at=0)
+        conn.execute(db.results.insert().values(player_id="anon", category="top", **row))
+        conn.execute(db.results.insert().values(player_id="anon", category="tech", **row))
+        conn.execute(db.results.insert().values(player_id="acct", category="top", **{**row, "score": 900}))
+        assert accounts.merge_players(conn, "anon", "acct") == 1
+        scores = dict(conn.execute(db.results.select().with_only_columns(
+            db.results.c.category, db.results.c.score)).all())
+        assert scores == {"top": 900, "tech": 100}
+        assert conn.execute(db.players.select().where(db.players.c.id == "anon")).first() is None
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("/?category=tech", "/?category=tech"), ("//evil.example", "/"), ("https://evil.example", "/"),
+    ("/\\evil.example", "/"), (None, "/"),
+])
+def test_safe_next(url, expected):
+    assert app_module.safe_next(url) == expected

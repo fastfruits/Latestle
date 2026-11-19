@@ -2,20 +2,66 @@
 
 from __future__ import annotations
 
+import os
 import re
-import uuid
-from datetime import date
+import secrets
+from datetime import date, timedelta
+from pathlib import Path
 
-from flask import Flask, g, jsonify, render_template, request
+from authlib.integrations.flask_client import OAuth, OAuthError
+from dotenv import load_dotenv
+from flask import Flask, abort, g, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-from latestle import db, game, news
+from latestle import accounts, db, game, news
 from latestle.puzzles import load_puzzle, today_utc
+
+load_dotenv()  # settings from a local .env file, if there is one
 
 app = Flask(__name__)
 
 PLAYER_COOKIE = "latestle_player"
 PLAYER_ID = re.compile(r"^[0-9a-f]{32}$")
 TWO_YEARS = 60 * 60 * 24 * 730
+GOOGLE_DISCOVERY = "https://accounts.google.com/.well-known/openid-configuration"
+
+
+# ---------- Config ----------
+
+def _secret_key() -> str:
+    """SECRET_KEY signs the session cookie that says who's signed in. In
+    development, make one and keep it in instance/ so restarts don't sign
+    everyone out."""
+    if os.environ.get("SECRET_KEY"):
+        return os.environ["SECRET_KEY"]
+    path = Path(app.instance_path) / "secret_key"
+    if not path.exists():
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(secrets.token_hex(32))
+    return path.read_text().strip()
+
+
+app.config.update(
+    SECRET_KEY=_secret_key(),
+    SESSION_COOKIE_NAME="latestle_session",
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SECURE_COOKIES") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=365),
+    GOOGLE_CLIENT_ID=os.environ.get("GOOGLE_CLIENT_ID"),
+    GOOGLE_CLIENT_SECRET=os.environ.get("GOOGLE_CLIENT_SECRET"),
+)
+
+if os.environ.get("BEHIND_PROXY") == "1":
+    # Hosts like Render and Heroku sit behind a proxy; trust its headers so
+    # the Google redirect URL comes out as https://your-domain/...
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+oauth = OAuth(app)
+oauth.register("google", server_metadata_url=GOOGLE_DISCOVERY, client_kwargs={"scope": "openid email profile"})
+
+
+def google_enabled() -> bool:
+    return bool(app.config.get("GOOGLE_CLIENT_ID") and app.config.get("GOOGLE_CLIENT_SECRET"))
 
 
 class BadRequest(Exception):
@@ -28,25 +74,93 @@ def bad_request(err):
     return jsonify(error=str(err)), 400
 
 
-# ---------- Players ----------
+# ---------- Players and accounts ----------
 
 @app.before_request
 def identify_player():
-    """Every visitor gets an anonymous ID in a cookie. No sign-up needed; it
-    just lets the server keep their progress and stats."""
-    pid = request.cookies.get(PLAYER_COOKIE, "")
-    g.new_player = not PLAYER_ID.match(pid)
-    g.player_id = uuid.uuid4().hex if g.new_player else pid
+    """Work out whose progress this request is about.
+
+    Signed in: the account's player. Otherwise an anonymous player ID from a
+    cookie, minted on the first visit. A cookie ID that belongs to an account
+    only works while signed in to that account.
+    """
+    g.user, g.new_player = None, False
+    if not request.path.startswith(("/api/", "/auth/")):
+        return
+    with db.engine().begin() as conn:
+        user_id = session.get("user_id")
+        if user_id:
+            g.user = accounts.get_user(conn, user_id)
+            if g.user:
+                g.player_id = g.user["player_id"]
+                return
+            session.pop("user_id", None)  # account no longer exists
+
+        pid = request.cookies.get(PLAYER_COOKIE, "")
+        if PLAYER_ID.match(pid) and not accounts.owner_of(conn, pid):
+            g.player_id = pid
+        else:
+            fresh_anonymous_player()
+
+
+def fresh_anonymous_player() -> None:
+    g.player_id, g.new_player = accounts.new_id(), True
 
 
 @app.after_request
 def remember_player(response):
-    if g.get("new_player") and request.path.startswith("/api/"):
+    if g.get("new_player"):
         response.set_cookie(
             PLAYER_COOKIE, g.player_id, max_age=TWO_YEARS,
             httponly=True, samesite="Lax", secure=request.is_secure,
         )
     return response
+
+
+def safe_next(url: str | None) -> str:
+    """Only redirect back to pages on this site."""
+    if url and url.startswith("/") and not url.startswith("//") and "\\" not in url:
+        return url
+    return "/"
+
+
+@app.get("/auth/google")
+def google_login():
+    if not google_enabled():
+        abort(404)
+    session["next"] = safe_next(request.args.get("next"))
+    redirect_uri = url_for("google_callback", _external=True)
+    return oauth.google.authorize_redirect(redirect_uri, prompt="select_account")
+
+
+@app.get("/auth/google/callback")
+def google_callback():
+    if not google_enabled():
+        abort(404)
+    next_url = safe_next(session.pop("next", None))
+    try:
+        token = oauth.google.authorize_access_token()
+    except OAuthError:
+        return redirect(next_url)  # they cancelled, or Google said no
+    info = token.get("userinfo") or oauth.google.userinfo(token=token)
+
+    with db.engine().begin() as conn:
+        user = accounts.sign_in(conn, g.player_id, info)
+
+    session.clear()  # new session on sign-in
+    session["user_id"] = user["id"]
+    session.permanent = True
+    # The old anonymous ID now belongs to the account; give the browser a
+    # fresh one for whenever they sign out.
+    fresh_anonymous_player()
+    return redirect(next_url)
+
+
+@app.post("/auth/logout")
+def logout():
+    session.clear()
+    fresh_anonymous_player()
+    return jsonify(ok=True)
 
 
 # ---------- Request helpers ----------
@@ -115,6 +229,7 @@ def get_state():
     with db.engine().begin() as conn:
         state = game.day_state(conn, g.player_id, day, puzzle)
     state["categories"] = [{"slug": c.slug, "name": c.name} for c in news.CATEGORIES.values()]
+    state["account"] = {"google_enabled": google_enabled(), "user": accounts.public(g.user)}
     return jsonify(state)
 
 
