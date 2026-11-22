@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -8,7 +9,7 @@ from sqlalchemy import create_engine
 import app as app_module
 from latestle import db, game, news, puzzles
 from latestle.news import Headline, build_rounds, proper_nouns, redact
-from latestle.puzzles import check_guess, load_puzzle, normalize, today_utc
+from latestle.puzzles import check_guess, load_puzzle, normalize, prune_puzzles, save_puzzle, stored_puzzle, today_utc
 
 YESTERDAY = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
 
@@ -36,13 +37,26 @@ HEADLINES = [
 
 
 @pytest.fixture
-def fake_news(tmp_path, monkeypatch):
-    """No network in tests: feeds return HEADLINES, puzzles go to a temp dir."""
+def fresh_db(tmp_path):
+    """A throwaway database: a SQLite file (not in-memory, so threads each get
+    a real connection), or set TEST_DATABASE_URL to run against Postgres."""
+    url = os.environ.get("TEST_DATABASE_URL")
+    if url:
+        engine = db.make_engine(url)
+        db.metadata.drop_all(engine)
+    else:
+        engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    db.use(engine)
+    yield
+    engine.dispose()
+
+
+@pytest.fixture
+def fake_news(fresh_db, monkeypatch):
+    """No network in tests: feeds return HEADLINES, puzzles go to a fresh database."""
     monkeypatch.setattr(news, "fetch_all", lambda feeds=None: list(HEADLINES))
     monkeypatch.setattr(news, "from_day", lambda hs, day: hs)
-    monkeypatch.setattr(puzzles, "PUZZLE_DIR", tmp_path)
     puzzles._failed_at.clear()
-    return tmp_path
 
 
 class Clock:
@@ -63,11 +77,6 @@ def clock(monkeypatch):
     c = Clock()
     monkeypatch.setattr(game, "now_ms", c)
     return c
-
-
-@pytest.fixture
-def fresh_db():
-    db.use(create_engine("sqlite://"))
 
 
 @pytest.fixture
@@ -133,8 +142,8 @@ def test_category_puzzles_are_saved_separately(fake_news):
     load_puzzle(date(2026, 11, 17))
     p = load_puzzle(date(2026, 11, 17), "science")
     assert p.category == "science" and p.meta()["category_name"] == "Science"
-    assert (fake_news / "2026-11-17.json").exists()
-    assert (fake_news / "2026-11-17-science.json").exists()
+    assert stored_puzzle(date(2026, 11, 17))["category"] == "top"
+    assert stored_puzzle(date(2026, 11, 17), "science")["category"] == "science"
     with pytest.raises(KeyError):
         load_puzzle(date(2026, 11, 17), "nope")
 
@@ -172,9 +181,9 @@ def test_short_answers_need_exact_match():
 def test_generates_once_and_saves(fake_news, monkeypatch):
     p = load_puzzle(date(2026, 11, 17))
     assert not p.sample and len(p.rounds) == 5 and p.number == 1
-    assert (fake_news / "2026-11-17.json").exists()
+    assert stored_puzzle(date(2026, 11, 17)) is not None
 
-    # Second load reads the file instead of fetching again.
+    # Second load reads the saved puzzle instead of fetching again.
     monkeypatch.setattr(news, "fetch_all", lambda *a: pytest.fail("should not refetch"))
     assert [r.answer for r in load_puzzle(date(2026, 11, 17)).rounds] == [r.answer for r in p.rounds]
 
@@ -183,6 +192,47 @@ def test_falls_back_to_samples_when_feeds_fail(fake_news, monkeypatch):
     monkeypatch.setattr(news, "fetch_all", lambda *a: [])
     p = load_puzzle(date(2026, 11, 18))
     assert p.sample and len(p.rounds) == 5
+    assert stored_puzzle(date(2026, 11, 18)) is None  # so a later try can build the real one
+
+
+def puzzle_data(answer):
+    return {"news_date": "2026-11-16", "rounds": [
+        {"answer": answer, "headline": "[REDACTED] wins", "original": f"{answer} wins"}]}
+
+
+def test_first_saved_puzzle_wins(fake_news):
+    day = date(2026, 11, 17)
+    assert save_puzzle(day, "top", puzzle_data("Paris"))
+    assert not save_puzzle(day, "top", puzzle_data("Rome"))
+    assert stored_puzzle(day)["rounds"][0]["answer"] == "Paris"
+    assert save_puzzle(day, "top", puzzle_data("Rome"), replace=True)
+    assert stored_puzzle(day)["rounds"][0]["answer"] == "Rome"
+
+
+def test_plays_the_puzzle_another_server_saved_first(fake_news, monkeypatch):
+    """Two servers build the same day at once: both end up playing the first one saved."""
+    day = date(2026, 11, 17)
+    real_generate = news.generate
+
+    def slow_generate(on, category):
+        save_puzzle(on, category, puzzle_data("Paris"))  # the other server finishes first
+        return real_generate(on, category)
+
+    monkeypatch.setattr(news, "generate", slow_generate)
+    assert [r.answer for r in load_puzzle(day).rounds] == ["Paris"]
+
+
+def test_only_recent_puzzles_are_kept(fake_news):
+    today = today_utc()
+    old, yesterday, tomorrow = today - timedelta(days=3), today - timedelta(days=1), today + timedelta(days=1)
+    for day in (yesterday, tomorrow, old):
+        save_puzzle(day, "top", puzzle_data("Paris"))
+    assert stored_puzzle(old)  # saving an old day by hand keeps it, for now
+
+    save_puzzle(today, "top", puzzle_data("Paris"))  # the next day's puzzle clears it out
+    assert stored_puzzle(old) is None
+    assert all(stored_puzzle(d) for d in (yesterday, today, tomorrow))
+    assert prune_puzzles(today + timedelta(days=2)) == 2  # yesterday and today
 
 
 def test_samples_are_valid():
@@ -376,7 +426,10 @@ def state(client, category="top"):
     return client.get(f"/api/state?date={today()}&category={category}").get_json()
 
 
-def test_sign_in_disabled_without_google_settings(client):
+def test_sign_in_disabled_without_google_settings(client, monkeypatch):
+    # Your own .env may have Google keys in it; this test is about running without them.
+    monkeypatch.setitem(app_module.app.config, "GOOGLE_CLIENT_ID", None)
+    monkeypatch.setitem(app_module.app.config, "GOOGLE_CLIENT_SECRET", None)
     assert state(client)["account"] == {"google_enabled": False, "user": None}
     assert client.get("/auth/google").status_code == 404
 
@@ -452,3 +505,22 @@ def test_merge_players_unit(fresh_db, clock):
 ])
 def test_safe_next(url, expected):
     assert app_module.safe_next(url) == expected
+
+
+# ---------- daily cron (Vercel) ----------
+
+def test_cron_needs_its_secret(client, monkeypatch):
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    assert client.get("/api/cron/daily").status_code == 404
+    monkeypatch.setenv("CRON_SECRET", "s3cret-value-for-tests")
+    assert client.get("/api/cron/daily").status_code == 401
+    assert client.get("/api/cron/daily", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_cron_builds_every_category(client, monkeypatch):
+    monkeypatch.setenv("CRON_SECRET", "s3cret-value-for-tests")
+    res = client.get("/api/cron/daily", headers={"Authorization": "Bearer s3cret-value-for-tests"})
+    assert res.status_code == 200
+    assert res.get_json()["built"] == {slug: True for slug in news.CATEGORIES}
+    assert "set-cookie" not in res.headers  # not a player
+    assert all(stored_puzzle(today_utc(), slug) for slug in news.CATEGORIES)

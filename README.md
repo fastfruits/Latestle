@@ -1,12 +1,12 @@
 # Latestle
 
-A daily speed game about yesterday's news.
+A daily speed game about news.
 
 Every day you get 5 real headlines from the day before, each with one name (a person, place, country or company) blacked out. You have 20 seconds per headline to fill in the blank. Faster answers score more. At the end you get a recap of every story with a link to the full article, and a result you can share:
 
 ## How a day's puzzle is made
 
-The first time anyone loads a day, the server builds that day's puzzle from the previous day's headlines and saves it to `puzzles/YYYY-MM-DD.json`, so every player gets the same rounds.
+The first time anyone loads a day, the server builds that day's puzzle from the previous day's headlines and saves it in the database, so every player gets the same rounds. On Vercel a daily cron job builds each day's puzzles just after midnight UTC, so the first player doesn't wait (see [Deploying](#deploying)).
 
 1. **Fetch** headlines from public RSS feeds (BBC News, NPR, The Guardian), keeping those published the day before. If that day is thin, it widens to the surrounding days, and then to the last few days if there still aren't five good stories.
 2. **Find names.** A word counts as a name if it appears capitalised mid-sentence and on its own somewhere ("Trump", "Nvidia"). This skips ordinary words that just start a headline and fragments of longer names like "Cape" in "Cape Town". Headlines written in Title Case (Foreign Policy, The Diplomat) are ignored here, since every word is capitalised.
@@ -20,7 +20,6 @@ The main page (`/`) is the original mix of top stories. Each category is its own
 | Category | Slug | Feeds |
 | --- | --- | --- |
 | Top stories | `top` | BBC News (top + world), NPR, The Guardian (world) |
-| World | `world` | BBC World, The Guardian World, NPR World, Al Jazeera |
 | USA | `usa` | BBC US & Canada, NPR National, NPR Politics, The Guardian US |
 | Europe | `europe` | BBC Europe, The Guardian Europe, Euronews, Politico Europe |
 | Geopolitics | `geopolitics` | Foreign Policy, The Diplomat, Al Jazeera, BBC Middle East, BBC Asia |
@@ -28,7 +27,9 @@ The main page (`/`) is the original mix of top stories. Each category is its own
 | Tech | `tech` | BBC Technology, NPR Technology, The Guardian Technology, Ars Technica |
 | Business | `business` | BBC Business, NPR Business, The Guardian Business |
 
-The main puzzle is saved as `puzzles/YYYY-MM-DD.json` and the others as `puzzles/YYYY-MM-DD-<slug>.json`. To add a category, add an entry to `CATEGORIES` in `latestle/news.py`.
+Each puzzle is a row in the `puzzles` table, keyed by date and category. Only the last few days are kept: puzzle dates are the player's local date, which is never more than a day either side of today in UTC, so whenever a new day's puzzle is saved, anything from before yesterday (UTC) is deleted. If two servers build the same day at once, the first one saved is the one everyone plays.
+
+To add a category, add an entry to `CATEGORIES` in `latestle/news.py`.
 
 If the feeds are unreachable, the game uses headlines from `puzzles/samples.json` and shows a "Sample headlines" badge. It tries the feeds again after 10 minutes.
 
@@ -36,12 +37,19 @@ To preview or pre-build a day:
 
 ```bash
 python scripts/generate_puzzle.py                  # preview today
-python scripts/generate_puzzle.py --save           # write puzzles/<today>.json
+python scripts/generate_puzzle.py --save           # save today's to the database
 python scripts/generate_puzzle.py --category science
 python scripts/generate_puzzle.py --category all --save
 ```
 
-You can hand-edit a saved puzzle file and the server will use your version. Generated puzzle files are git-ignored. Use `git add -f` if you want to commit one.
+To hand-edit a puzzle (swap a headline, fix an answer), export it as JSON, edit it, and save it back over the generated one:
+
+```bash
+python scripts/generate_puzzle.py --json > puzzle.json
+python scripts/generate_puzzle.py --from-file puzzle.json --force
+```
+
+The script uses `DATABASE_URL` from `.env`, so point that at the production database to edit the live puzzle.
 
 ## Scoring
 
@@ -76,16 +84,8 @@ Players can sign in with Google (the person button at the top right) so their pr
 
 Who's signed in is kept in a signed session cookie (`latestle_session`, 1 year). The only Google data stored is the account ID, email, name and picture.
 
-**Setting it up**
 
-1. In the [Google Cloud console](https://console.cloud.google.com/apis/credentials), create a project. Set up the OAuth consent screen (app name, support email; the `openid`, `email` and `profile` scopes need no review).
-2. Create credentials → **OAuth client ID** → **Web application**. Under *Authorised redirect URIs* add `http://localhost:5001/auth/google/callback`, plus `https://<your-domain>/auth/google/callback` once deployed.
-3. Copy `.env.example` to `.env` and fill in `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. The app loads `.env` automatically, and `.env` is git-ignored.
-4. Restart the app. The sign-in button appears once both values are set. Without them the game runs as before, anonymous only.
-
-While the consent screen is in *Testing* mode, only Google accounts you add as test users can sign in. Publish it when you launch.
-
-By default the database is SQLite at `instance/latestle.db` (git-ignored, created automatically). For production, set `DATABASE_URL` to a Postgres URL and `pip install "psycopg[binary]"`. There are no migrations yet: if the table layout changes during development, delete `instance/latestle.db` and it will be recreated.
+By default the database is SQLite at `instance/latestle.db` (git-ignored, created automatically). For production, set `DATABASE_URL` to a Postgres URL. Plain `postgres://` and `postgresql://` URLs are switched to the psycopg 3 driver automatically. There are no migrations yet: if the table layout changes during development, delete `instance/latestle.db` and it will be recreated.
 
 ## Code layout
 
@@ -95,10 +95,11 @@ By default the database is SQLite at `instance/latestle.db` (git-ignored, create
 | Accounts: sign-in, linking and merging progress | `latestle/accounts.py` |
 | Fetching headlines and picking answers | `latestle/news.py` |
 | Loading or generating puzzles, checking guesses | `latestle/puzzles.py` |
-| Database tables | `latestle/db.py` |
+| Database tables and connection | `latestle/db.py` |
 | Server-timed rounds, scoring, results and stats | `latestle/game.py` |
-| Page, styles, game logic | `templates/index.html`, `static/` |
+| Page, styles, game logic | `templates/index.html`, `public/static/` (in `public/` so Vercel's CDN serves them) |
 | Fallback headlines | `puzzles/samples.json` |
+| Vercel cron schedule | `vercel.json` |
 
 ### API
 
@@ -112,16 +113,6 @@ Every call takes `date` (the player's local `YYYY-MM-DD`) and an optional `categ
 - `GET /api/stats` returns this player's stats for the category.
 
 The puzzle changes at the player's own midnight, because the browser sends its local date. The server only accepts today ± 1 day.
-
-## Deploying
-
-The `Procfile` runs `gunicorn app:app`, which works on Render, Railway, Heroku and similar hosts. Set these there (see `.env.example`):
-
-- `DATABASE_URL`: use Postgres. A SQLite file on a temporary filesystem would lose every player's progress on restart.
-- `SECRET_KEY`: a long random value. Changing it signs everyone out.
-- `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, with the production redirect URI added in Google's console.
-- `SECURE_COOKIES=1` (served over https) and `BEHIND_PROXY=1` (so the redirect to Google uses your real https address).
- Likewise, a day's puzzle is rebuilt if the server restarts. Usually that gives the same rounds, but not always if the feeds changed in between. Saving puzzles to a database or storage bucket would fix that.
 
 ## Ideas for what's next
 

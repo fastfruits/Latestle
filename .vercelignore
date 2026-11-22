@@ -1,0 +1,8 @@
+.venv/
+.env
+instance/
+tests/
+puzzles/20*.json
+.pytest_cache/
+.mypy_cache/
+__pycache__/

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -14,11 +16,16 @@ from flask import Flask, abort, g, jsonify, redirect, render_template, request, 
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from latestle import accounts, db, game, news
-from latestle.puzzles import load_puzzle, today_utc
+from latestle.puzzles import load_puzzle, prune_puzzles, today_utc
 
 load_dotenv()  # settings from a local .env file, if there is one
 
-app = Flask(__name__)
+# Vercel sets this on its servers: always https, behind its proxy, read-only disk.
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+
+# Static files live in public/static: Vercel serves public/ from its CDN (it
+# ignores Flask's own static folder), and Flask serves the same files locally.
+app = Flask(__name__, static_folder="public/static", static_url_path="/static")
 
 PLAYER_COOKIE = "latestle_player"
 PLAYER_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -34,6 +41,8 @@ def _secret_key() -> str:
     everyone out."""
     if os.environ.get("SECRET_KEY"):
         return os.environ["SECRET_KEY"]
+    if ON_VERCEL:
+        raise RuntimeError("Set SECRET_KEY in the Vercel project's environment variables.")
     path = Path(app.instance_path) / "secret_key"
     if not path.exists():
         path.parent.mkdir(exist_ok=True)
@@ -45,14 +54,14 @@ app.config.update(
     SECRET_KEY=_secret_key(),
     SESSION_COOKIE_NAME="latestle_session",
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("SECURE_COOKIES") == "1",
+    SESSION_COOKIE_SECURE=ON_VERCEL or os.environ.get("SECURE_COOKIES") == "1",
     PERMANENT_SESSION_LIFETIME=timedelta(days=365),
     GOOGLE_CLIENT_ID=os.environ.get("GOOGLE_CLIENT_ID"),
     GOOGLE_CLIENT_SECRET=os.environ.get("GOOGLE_CLIENT_SECRET"),
 )
 
-if os.environ.get("BEHIND_PROXY") == "1":
-    # Hosts like Render and Heroku sit behind a proxy; trust its headers so
+if ON_VERCEL or os.environ.get("BEHIND_PROXY") == "1":
+    # Hosts like Vercel and Render sit behind a proxy; trust its headers so
     # the Google redirect URL comes out as https://your-domain/...
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
@@ -85,7 +94,7 @@ def identify_player():
     only works while signed in to that account.
     """
     g.user, g.new_player = None, False
-    if not request.path.startswith(("/api/", "/auth/")):
+    if not request.path.startswith(("/api/", "/auth/")) or request.path.startswith("/api/cron/"):
         return
     with db.engine().begin() as conn:
         user_id = session.get("user_id")
@@ -258,6 +267,28 @@ def post_end():
 def get_stats():
     with db.engine().begin() as conn:
         return jsonify(game.player_stats(conn, g.player_id, requested_date(), requested_category()))
+
+
+@app.route("/api/cron/daily", methods=["GET", "POST"])
+def daily_cron():
+    """Vercel calls this once a day, just after midnight UTC (see vercel.json):
+    build the day's puzzles before the first player arrives, and delete ones
+    too old to play. Vercel sends CRON_SECRET as a Bearer token."""
+    secret = os.environ.get("CRON_SECRET")
+    if not secret:
+        abort(404)
+    sent = request.headers.get("Authorization", "").encode()
+    if not hmac.compare_digest(sent, f"Bearer {secret}".encode()):
+        abort(401)
+
+    day = today_utc()
+
+    def build(category):
+        return category, not load_puzzle(day, category).sample
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        built = dict(pool.map(build, news.CATEGORIES))
+    return jsonify(date=day.isoformat(), built=built, removed=prune_puzzles(day))
 
 
 if __name__ == "__main__":

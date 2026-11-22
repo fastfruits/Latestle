@@ -4,3 +4,4 @@ SQLAlchemy==2.1.9
 Authlib==1.9.9
 requests==2.34.2
 python-dotenv==1.2.4
+psycopg[binary]==3.3.9

@@ -8,9 +8,7 @@ fill it in. Answers stay on the server until a round is over.
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 import threading
 import time
 import unicodedata
@@ -19,7 +17,10 @@ from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from latestle import news
+from sqlalchemy import and_, delete, select
+from sqlalchemy.exc import IntegrityError
+
+from latestle import db, news
 
 PUZZLE_DIR = Path(__file__).resolve().parent.parent / "puzzles"
 SAMPLES_FILE = PUZZLE_DIR / "samples.json"
@@ -109,7 +110,12 @@ def _round_from(data: dict) -> Round:
     return Round(**{k: v for k, v in data.items() if k in fields})
 
 
-# ---------- Loading ----------
+# ---------- Loading and saving ----------
+
+# Puzzles are dated by the player's local day, which is never more than one
+# day either side of today in UTC. Older puzzles can't be played any more, so
+# they're deleted whenever a new one is saved.
+KEEP_DAYS_BEFORE_TODAY = 1
 
 _locks: dict[tuple[str, date], threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -123,19 +129,50 @@ def _lock_for(key: tuple[str, date]) -> threading.Lock:
         return _locks.setdefault(key, threading.Lock())
 
 
-def puzzle_path(on: date, category: str = news.TOP) -> Path:
-    """puzzles/YYYY-MM-DD.json for the main edition, YYYY-MM-DD-<category>.json
-    for the others."""
-    suffix = "" if category == news.TOP else f"-{category}"
-    return PUZZLE_DIR / f"{on.isoformat()}{suffix}.json"
+def _where(on: date, category: str):
+    c = db.puzzles.c
+    return and_(c.puzzle_date == on.isoformat(), c.category == category)
 
 
-def _write_atomic(path: Path, data: dict) -> None:
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+def stored_puzzle(on: date, category: str = news.TOP) -> dict | None:
+    """The saved puzzle data for a day and category, if there is one."""
+    with db.engine().connect() as conn:
+        raw = conn.execute(select(db.puzzles.c.data).where(_where(on, category))).scalar()
+    return json.loads(raw) if raw else None
+
+
+def save_puzzle(on: date, category: str, data: dict, replace: bool = False) -> bool:
+    """Save a day's puzzle and delete ones too old to play.
+
+    The first puzzle saved for a day is the one everyone plays: if another
+    server got there first this returns False and leaves theirs alone, unless
+    `replace` is set (for swapping in a hand-edited puzzle).
+    """
+    row = {
+        "puzzle_date": on.isoformat(),
+        "category": category,
+        "data": json.dumps(data, ensure_ascii=False),
+        "created_at": int(time.time() * 1000),
+    }
+    try:
+        with db.engine().begin() as conn:
+            if replace:
+                conn.execute(delete(db.puzzles).where(_where(on, category)))
+            conn.execute(db.puzzles.insert().values(**row))
+    except IntegrityError:
+        return False
+    prune_puzzles(keep=on)
+    return True
+
+
+def prune_puzzles(today: date | None = None, keep: date | None = None) -> int:
+    """Delete puzzles from before yesterday (UTC). `keep` protects a day that
+    was just saved, e.g. an old date built by hand with the script."""
+    cutoff = (today or today_utc()) - timedelta(days=KEEP_DAYS_BEFORE_TODAY)
+    if keep:
+        cutoff = min(cutoff, keep)
+    with db.engine().begin() as conn:
+        return conn.execute(delete(db.puzzles).where(db.puzzles.c.puzzle_date < cutoff.isoformat())).rowcount
 
 
 def _sample_puzzle(on: date, category: str = news.TOP) -> Puzzle:
@@ -148,29 +185,32 @@ def _sample_puzzle(on: date, category: str = news.TOP) -> Puzzle:
 def load_puzzle(on: date, category: str = news.TOP, generate: bool = True) -> Puzzle:
     """The puzzle for a day in one category.
 
-    1. The saved puzzle file if it exists (hand-written or generated earlier).
+    1. The saved puzzle if there is one (generated earlier, or put there by
+       scripts/generate_puzzle.py).
     2. Otherwise build one from the previous day's headlines and save it, so
        every player gets the same rounds.
-    3. If the feeds fail, fall back to the sample pool.
+    3. If the feeds fail, fall back to the sample pool (not saved, so the
+       next try after RETRY_AFTER_SECONDS can still build the real one).
     """
     if category not in news.CATEGORIES:
         raise KeyError(category)
-    path = puzzle_path(on, category)
     key = (category, on)
+    data = stored_puzzle(on, category)
 
-    if not path.exists() and generate:
+    if data is None and generate:
         recently_failed = time.time() - _failed_at.get(key, 0) < RETRY_AFTER_SECONDS
         if not recently_failed:
             with _lock_for(key):
-                if not path.exists():  # another request may have just made it
-                    data = news.generate(on, category)
-                    if data:
-                        _write_atomic(path, data)
+                data = stored_puzzle(on, category)  # another request may have just made it
+                if data is None:
+                    built = news.generate(on, category)
+                    if built:
+                        # If another server saved one first, play theirs.
+                        data = built if save_puzzle(on, category, built) else stored_puzzle(on, category)
                     else:
                         _failed_at[key] = time.time()
 
-    if path.exists():
-        data = json.loads(path.read_text())
+    if data:
         return Puzzle(
             date=on,
             news_date=date.fromisoformat(data["news_date"]),
